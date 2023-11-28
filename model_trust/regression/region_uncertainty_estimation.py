@@ -1,6 +1,9 @@
+import copy
+import base64
 import logging
 import joblib
 import numpy as np
+from skl2onnx import to_onnx
 from model_trust.base.utils.mt_performance import conformal_percentile
 from model_trust.base.posthoc_base_uncertainty_estimator import (
     PosthocBaseUncertaintyEstimator,
@@ -9,6 +12,7 @@ from model_trust.base.region_identification.region_identification_models import 
     SingleRegion,
     RegionQuantileTreeIdentification,
 )
+from model_trust.base.utils.data_utils import nparray_to_list
 
 LOGGER = logging.getLogger(__name__)
 
@@ -100,7 +104,7 @@ class RegionUncertaintyEstimator(PosthocBaseUncertaintyEstimator):
         ix = 0
         for m in np.sort(np.unique(membership)):
             self.regions_stats.append(conformity_scores[membership == m])
-            self.regions_id[m] = ix
+            self.regions_id[int(m)] = ix
             ix += 1
 
             if np.min(conformity_scores) < 0:
@@ -121,12 +125,18 @@ class RegionUncertaintyEstimator(PosthocBaseUncertaintyEstimator):
 
         if self.regions_model_type == "multi_region":
             self.learned_config["leaf_values"] = self.regions_model.leaf_values
-            self.learned_config["region_model"] = self.regions_model.region_model
+            onx = to_onnx(
+                self.regions_model.region_model, X_input[:1].astype(np.float32)
+            )
+            onx_ser = onx.SerializeToString()
+            self.learned_config["region_model"] = base64.b64encode(onx_ser).decode(
+                "ascii"
+            )
 
         return self
 
     def export_learned_config(self):
-        return self.learned_config
+        return nparray_to_list(copy.deepcopy(self.learned_config))
 
     def predict(
         self,
