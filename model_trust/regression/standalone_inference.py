@@ -85,4 +85,4 @@ def cp_inference(learned_config, X, y_pred, percentile=None):
         if q < 0:
             LOGGER.warning("Warning quantile < 0 for sample " + str(i) + str(q))
         interval.append([y_pred[i, 0] - np.abs(q), y_pred[i, 0] + np.abs(q)])
-    return np.array(interval)
+    return interval
