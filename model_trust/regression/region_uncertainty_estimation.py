@@ -104,7 +104,7 @@ class RegionUncertaintyEstimator(PosthocBaseUncertaintyEstimator):
         ix = 0
         for m in np.sort(np.unique(membership)):
             self.regions_stats.append(conformity_scores[membership == m])
-            self.regions_id[int(m)] = ix
+            self.regions_id[str(m)] = ix
             ix += 1
 
             if np.min(conformity_scores) < 0:
@@ -164,7 +164,7 @@ class RegionUncertaintyEstimator(PosthocBaseUncertaintyEstimator):
         error_pval = self.get_regions_error_percentile(percentile=percentile)
 
         for i in range(membership.shape[0]):
-            region_i = self.regions_id[membership[i]]
+            region_i = self.regions_id[str(membership[i])]
             q = error_pval[region_i]
             if q < 0:
                 LOGGER.warning("Warning quantile < 0 for sample " + str(i) + str(q))
