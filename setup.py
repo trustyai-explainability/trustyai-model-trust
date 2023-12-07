@@ -16,6 +16,8 @@ install_requires = [
     "optuna==3.4.0",
     "mlprodict",
     "jyquickhelper",
+    "skl2onnx",
+    "onnxruntime",
 ]
 
 extra_requires = {"plot": ["matplotlib"]}
