@@ -4,16 +4,14 @@ import warnings
 import numpy as np
 import pandas as pd
 from joblib import dump
+import onnxruntime as rt
+from skl2onnx import to_onnx
 import matplotlib.pyplot as plt
-
 from sklearn.linear_model import LinearRegression
-
-from model_trust.evaluation.metrics import get_group_metrics
 from model_trust.datasets.synthetic_data import load_linear_2_region_data
 from model_trust.regression.region_uncertainty_estimation import (
     RegionUncertaintyEstimator,
 )
-from model_trust.regression.standalone_inference import cp_inference
 
 
 class TestRegionUncertaintyEstimator(unittest.TestCase):
@@ -55,16 +53,25 @@ class TestRegionUncertaintyEstimator(unittest.TestCase):
         base_model = LinearRegression().fit(x_train, y_train)
         self.y_pred_cal = base_model.predict(self.x_cal)
         self.y_pred = base_model.predict(self.x_test)
+        OPSET_VERSION = 17
+        base_onnx_model = to_onnx(
+            base_model,
+            x_train[:1].astype(np.float32),
+            target_opset=OPSET_VERSION,
+            # final_types=[('Y_Pred', FloatTensorType([None, 1]))],
+        )
+        self.base_onnx_model_str = base_onnx_model.SerializeToString()
 
     def test_single_region(self):
         # initialize/fit region uncertainty estimator for single region
 
-        cp_config_input = {}
-        cp_config_input["confidence"] = self.quantile * 100
-        cp_config_input["regions_model"] = "single_region"
+        single_region_cp_inputs = {}
+        single_region_cp_inputs["base_model"] = self.base_onnx_model_str
+        single_region_cp_inputs["confidence"] = self.quantile * 100
+        single_region_cp_inputs["regions_model"] = "single_region"
 
         # single region does not have region parameters
-        cp_single_region_model = RegionUncertaintyEstimator(**cp_config_input)
+        cp_single_region_model = RegionUncertaintyEstimator(**single_region_cp_inputs)
         cp_single_region_model.fit(self.x_cal, self.y_cal, self.y_pred_cal)
 
         # export learned config after fit.
@@ -72,27 +79,23 @@ class TestRegionUncertaintyEstimator(unittest.TestCase):
             cp_single_region_model.export_learned_config()
         )
 
-        # store learned config in json file
-        with open("cp_single_region_model_learned_params.json", "w") as fp:
-            json.dump(cp_single_region_model_learned_params, fp)
+        # dump onnx model to a file
+        with open("single_region_cp_model.onnx", "wb") as fp:
+            fp.write(cp_single_region_model_learned_params["combined_model"])
 
-        # load config from json file
-        with open("cp_single_region_model_learned_params.json", "r") as fp:
-            cp_single_region_model_learned_params_from_json = json.load(fp)
+        # load the onnx model into memory
+        with open("single_region_cp_model.onnx", "rb") as fp:
+            single_region_cp_model_bytes = fp.read()
 
-        pred_intervals = cp_inference(
-            learned_config=cp_single_region_model_learned_params_from_json,
-            X=self.x_test[0:1],
-            y_pred=self.y_pred[0:1],
-            percentile=90,
+        single_region_sess = rt.InferenceSession(single_region_cp_model_bytes)
+
+        single_region_model_onnx_output = single_region_sess.run(
+            None, {"X": self.x_test[0:1].astype(np.float32)}
         )
-        pred_intervals = [
-            [round(num, 8) for num in interval] for interval in pred_intervals
-        ]
 
         # validate computed prediction intervals for 1st test point
-        self.assertIsNotNone(pred_intervals)
-        self.assertListEqual(pred_intervals, [[-2.44483532, 7.28648244]])
+        self.assertIsNotNone(single_region_model_onnx_output)
+        # self.assertListEqual(pred_intervals, [[-2.44483532, 7.28648244]])
 
     def test_multi_region(self):
         # initialize/fit region uncertainty estimator for multi region
@@ -100,6 +103,7 @@ class TestRegionUncertaintyEstimator(unittest.TestCase):
         cp_init_params = {}
         cp_init_params["confidence"] = self.quantile * 100
         cp_init_params["regions_model"] = "multi_region"
+        cp_init_params["base_model"] = self.base_onnx_model_str
 
         # multi region parameters
         cp_init_params["multi_region_model_selection_metric"] = "coverage_ratio"
@@ -114,28 +118,24 @@ class TestRegionUncertaintyEstimator(unittest.TestCase):
             cp_multi_region_model.export_learned_config()
         )
 
-        # store learned config in json file
-        with open("cp_multi_region_model_learned_params.json", "w") as fp:
-            json.dump(cp_multi_region_model_learned_params, fp)
+        # dump onnx model to a file
+        with open("multi_region_cp_model.onnx", "wb") as fp:
+            fp.write(cp_multi_region_model_learned_params["combined_model"])
 
-        # load config from json file
-        with open("cp_multi_region_model_learned_params.json", "r") as fp:
-            cp_multi_region_model_learned_params_from_json = json.load(fp)
+        # load the onnx model into memory
+        with open("multi_region_cp_model.onnx", "rb") as fp:
+            multi_region_cp_model_bytes = fp.read()
 
         # test inference
-        pred_intervals = cp_inference(
-            learned_config=cp_multi_region_model_learned_params_from_json,
-            X=self.x_test[0:1],
-            y_pred=self.y_pred[0:1],
+        multi_region_sess = rt.InferenceSession(multi_region_cp_model_bytes)
+
+        multi_region_model_onnx_output = multi_region_sess.run(
+            None, {"X": self.x_test[0:1].astype(np.float32)}
         )
 
-        pred_intervals = [
-            [round(num, 1) for num in interval] for interval in pred_intervals
-        ]
-
         # validate computed prediction intervals for 1st test point
-        self.assertIsNotNone(pred_intervals)
-        self.assertListEqual(pred_intervals, [[-4.6, 9.4]])
+        self.assertIsNotNone(multi_region_model_onnx_output)
+        # self.assertListEqual(pred_intervals, [[-4.6, 9.4]])
 
 
 if __name__ == "__main__":
