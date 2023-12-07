@@ -1,9 +1,14 @@
+import io
 import copy
 import base64
 import logging
 import joblib
+import onnx
+import torch
 import numpy as np
+import onnxruntime as rt
 from skl2onnx import to_onnx
+from onnx.compose import merge_models
 from model_trust.base.utils.mt_performance import conformal_percentile
 from model_trust.base.posthoc_base_uncertainty_estimator import (
     PosthocBaseUncertaintyEstimator,
@@ -13,6 +18,10 @@ from model_trust.base.region_identification.region_identification_models import 
     RegionQuantileTreeIdentification,
 )
 from model_trust.base.utils.data_utils import nparray_to_list
+from model_trust.regression.standalone_inference.torch_inference import (
+    CPInferenceSingleRegion,
+    CPInferenceMultiRegion,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -26,14 +35,18 @@ class RegionUncertaintyEstimator(PosthocBaseUncertaintyEstimator):
 
     def __init__(
         self,
-        regions_model="single_region",
-        regions_model_input_type="covariates",
+        base_model: bytes,
+        regions_model: str = "single_region",
+        regions_model_input_type: str = "covariates",
         confidence: int = 95,
         random_state: int = 42,
+        opset_version: int = 17,
         **kwargs,
     ):
         """
         Parameters:
+            base_model: ONNX serialized model string converted to bytes using .SerializeToString(). Refer to 
+                https://onnx.ai/onnx/api/serialization.html#onnx.ModelProto for example usage.
             regions_model: RegionIdentification that defines the type of model that is used to cluster the input
                 space into the different uncertainty regions, from the region_identification submodule. Allowed
                 values are "single_region", "multi_region". If single_region,
@@ -47,6 +60,7 @@ class RegionUncertaintyEstimator(PosthocBaseUncertaintyEstimator):
 
 
         """
+        self.base_model = base_model
         self.random_state = random_state
 
         ### Region identification params ###
@@ -73,6 +87,7 @@ class RegionUncertaintyEstimator(PosthocBaseUncertaintyEstimator):
         else:
             raise Exception("Region model {} is not supported.".format(regions_model))
         self.regions_model_type = regions_model
+        self.opset_version = opset_version
 
     def fit(self, X, y, y_pred):
         """
@@ -117,6 +132,15 @@ class RegionUncertaintyEstimator(PosthocBaseUncertaintyEstimator):
                     + str(np.mean(conformity_scores[membership == m]))
                 )
 
+        # torch based onnx serialization
+        torch_input_name = "input_x"
+        torch_output_names = [
+            "prediction",
+            "exp_lower_pred_endpoint",
+            "exp_upper_pred_endpoint",
+        ]
+
+        # old code snippet
         self.learned_config["regions_stats"] = self.regions_stats
         self.learned_config["regions_id"] = self.regions_id
         self.learned_config["region_model_type"] = self.regions_model_type
@@ -125,13 +149,249 @@ class RegionUncertaintyEstimator(PosthocBaseUncertaintyEstimator):
 
         if self.regions_model_type == "multi_region":
             self.learned_config["leaf_values"] = self.regions_model.leaf_values
-            onx = to_onnx(
-                self.regions_model.region_model, X_input[:1].astype(np.float32)
+            base_onnx_model = onnx.load_model_from_string(self.base_model)
+            # avoid output name conflicts between different models
+            base_and_region_model = onnx.compose.add_prefix(
+                base_onnx_model,
+                prefix="base_model_",
+                rename_nodes=False,
+                rename_edges=False,
+                rename_inputs=False,
+                rename_outputs=True,
+                rename_initializers=False,
+                rename_value_infos=False,
+                rename_functions=False,
+                inplace=False,
             )
-            onx_ser = onx.SerializeToString()
-            self.learned_config["region_model"] = base64.b64encode(onx_ser).decode(
-                "ascii"
+
+            # add identity node
+            id_node = onnx.helper.make_node(
+                "Identity",
+                inputs=[base_and_region_model.graph.input[0].name],
+                outputs=["x_orig"],
             )
+            base_and_region_model.graph.node.insert(
+                len(base_and_region_model.graph.node), id_node
+            )
+
+            # add identity node output
+            id_output_var = copy.deepcopy(base_and_region_model.graph.input[0])
+            id_output_var.name = "x_orig"
+            base_and_region_model.graph.output.insert(0, id_output_var)
+
+            # find opset ai.onnx and ai.onnx.ml in base model
+            base_opset_ai_onnx = None
+            base_opset_ai_onnx_indx = None
+            base_opset_ai_onnx_ml = None
+            base_opset_ai_onnx_ml_indx = None
+            base_opset_list = (
+                []
+            )  # what if it is not present in base model? - should be added to the model
+            for field in base_and_region_model.ListFields():
+                if field[0].name == "opset_import":
+                    base_opset_list = field[1]
+                    for i, operatorIdProto in enumerate(field[1]):
+                        if (not operatorIdProto.HasField("domain")) or (
+                            operatorIdProto.domain in ["", "ai.onnx"]
+                        ):
+                            base_opset_ai_onnx = operatorIdProto
+                            base_opset_ai_onnx_indx = i
+                        elif operatorIdProto.domain == "ai.onnx.ml":
+                            base_opset_ai_onnx_ml = operatorIdProto
+                            base_opset_ai_onnx_ml_indx = i
+
+            if base_opset_ai_onnx is None:
+                base_opset_ai_onnx = onnx.onnx_ml_pb2.OperatorSetIdProto(
+                    version=self.opset_version, domain="ai.onnx"
+                )
+                base_opset_list.append(base_opset_ai_onnx)
+
+            # cp region model
+            region_model = to_onnx(
+                self.regions_model.region_model,
+                X_input[:1].astype(np.float32),
+                target_opset=base_opset_ai_onnx.version,
+            )
+            region_model_str = region_model.SerializeToString()
+            self.learned_config["region_model"] = base64.b64encode(
+                region_model_str
+            ).decode("ascii")
+
+            # verify versions
+            # cp region opset
+            region_opset_ai_onnx = None
+            region_opset_ai_onnx_indx = None
+            region_opset_ai_onnx_ml = None
+            region_opset_ai_onnx_ml_indx = None
+            for field in region_model.ListFields():
+                if field[0].name == "opset_import":
+                    for i, operatorIdProto in enumerate(field[1]):
+                        if (not operatorIdProto.HasField("domain")) or (
+                            operatorIdProto.domain in ["", "ai.onnx"]
+                        ):
+                            region_opset_ai_onnx = operatorIdProto
+                            region_opset_ai_onnx_indx = i
+                        elif operatorIdProto.domain == "ai.onnx.ml":
+                            region_opset_ai_onnx_ml = operatorIdProto
+                            region_opset_ai_onnx_ml_indx = i
+
+            if (base_opset_ai_onnx is not None) and (region_opset_ai_onnx is not None):
+                if base_opset_ai_onnx.version != region_opset_ai_onnx.version:
+                    raise Exception(
+                        "base model opset version for ai.onnx {} is different from region opset version {}".format(
+                            base_opset_ai_onnx.version, region_opset_ai_onnx.version
+                        )
+                    )
+
+            if (base_opset_ai_onnx_ml is not None) and (
+                region_opset_ai_onnx_ml is not None
+            ):
+                if base_opset_ai_onnx_ml.version != region_opset_ai_onnx_ml.version:
+                    raise Exception(
+                        "base model opset version for ai.onnx.ml {} is different from region opset version {}".format(
+                            base_opset_ai_onnx_ml.version,
+                            region_opset_ai_onnx_ml.version,
+                        )
+                    )
+
+            if base_opset_ai_onnx_ml is None:
+                base_opset_list.append(region_opset_ai_onnx_ml)
+
+            # add region model to base model pipeline
+            base_and_region_model.graph.node.insert(
+                len(base_and_region_model.graph.node), region_model.graph.node[0]
+            )
+
+            # add region model output
+            base_and_region_model.graph.output.insert(
+                len(base_and_region_model.graph.output), region_model.graph.output[0]
+            )
+
+            # graph name
+            base_and_region_model.graph.name = (
+                "Modified_ONNX_Pipeline_with_Region_Model"
+            )
+
+            # mode metadata
+            base_and_region_model.producer_name = "Region_Uncertainty_Estimator"
+            if base_and_region_model.HasField("model_version"):
+                base_and_region_model.model_version = (
+                    base_and_region_model.model_version + 1
+                )
+            else:
+                base_and_region_model.model_version = 1
+
+            # initialize inference class for multi-region
+            torch_cp_predictor = CPInferenceMultiRegion(
+                conformity_scores_list=self.regions_stats,
+                leaf_values=self.regions_model.leaf_values,
+                quantile=self.confidence / 100,
+            )
+            base_and_region_model_sess = rt.InferenceSession(
+                base_and_region_model.SerializeToString()
+            )
+            # get sample data points for torch inference
+            upto_tree_model_output = base_and_region_model_sess.run(
+                None, {"X": X_input[0:1].astype(np.float32)}
+            )
+
+            cp_inputs = {  # x_orig, base_prediction, region_prediction
+                "x_orig": torch.from_numpy(upto_tree_model_output[0]).float(),
+                "base_prediction": torch.from_numpy(upto_tree_model_output[1]).float(),
+                "region_prediction": torch.from_numpy(
+                    upto_tree_model_output[2]
+                ).float(),
+            }
+
+            torch_input_names = ["x_orig", "base_prediction", "region_prediction"]
+
+            torch_output_names = [
+                "input_x",
+                "prediction",
+                "region_model_prediction",
+                "exp_lower_pred_endpoint",
+                "exp_upper_pred_endpoint",
+            ]
+
+            cp_model_bytes = io.BytesIO()
+            torch.onnx.export(
+                torch_cp_predictor,
+                cp_inputs,
+                cp_model_bytes,
+                export_params=True,  # store the trained parameter weights inside the model file
+                opset_version=self.opset_version,
+                input_names=torch_input_names,  # the model's input names
+                output_names=torch_output_names,  # the model's output names
+                dynamic_axes={
+                    torch_input_names[0]: {0: "batch_size"},  # variable length axes
+                    torch_input_names[1]: {0: "batch_size"},
+                    torch_input_names[2]: {0: "batch_size"},
+                    torch_output_names[0]: {0: "batch_size"},
+                    torch_output_names[1]: {0: "batch_size"},
+                    torch_output_names[2]: {0: "batch_size"},
+                    torch_output_names[3]: {0: "batch_size"},
+                    torch_output_names[4]: {0: "batch_size"},
+                },
+            )
+            cp_onnx_model = onnx.load_model_from_string(cp_model_bytes.getvalue())
+
+            combined_model = merge_models(
+                base_and_region_model,
+                cp_onnx_model,
+                io_map=[
+                    (
+                        base_and_region_model.graph.output[0].name,
+                        torch_input_names[0],
+                    ),
+                    (
+                        base_and_region_model.graph.output[1].name,
+                        torch_input_names[1],
+                    ),
+                    (
+                        base_and_region_model.graph.output[2].name,
+                        torch_input_names[2],
+                    ),
+                ],
+            )
+            self.learned_config["combined_model"] = combined_model.SerializeToString()
+
+        else:
+            torch_cp_predictor = CPInferenceSingleRegion(
+                conformity_scores=np.array(self.regions_stats[0]),
+                quantile=self.confidence / 100,
+            )
+            cp_input = torch.from_numpy(y_pred.reshape(-1, 1)[:1]).float()
+
+            cp_model_bytes = io.BytesIO()
+            torch.onnx.export(
+                torch_cp_predictor,
+                cp_input,
+                cp_model_bytes,
+                export_params=True,  # store the trained parameter weights inside the model file
+                opset_version=self.opset_version,
+                input_names=[torch_input_name],  # the model's input names
+                output_names=torch_output_names,  # the model's output names
+                dynamic_axes={
+                    torch_input_name: {0: "batch_size"},  # variable length axes
+                    torch_output_names[0]: {0: "batch_size"},
+                    torch_output_names[1]: {0: "batch_size"},
+                    torch_output_names[2]: {0: "batch_size"},
+                },
+            )
+            cp_onnx_model = onnx.load_model_from_string(cp_model_bytes.getvalue())
+            base_onnx_model = onnx.load_model_from_string(self.base_model)
+            combined_model = merge_models(
+                base_onnx_model,
+                cp_onnx_model,
+                io_map=[
+                    (
+                        base_onnx_model.graph.output[0].name,
+                        torch_input_name,
+                    )
+                ],  # Link i/o
+            )
+
+            self.learned_config["combined_model"] = combined_model.SerializeToString()
 
         return self
 

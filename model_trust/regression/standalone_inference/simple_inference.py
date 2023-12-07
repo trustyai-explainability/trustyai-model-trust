@@ -34,15 +34,14 @@ def cp_inference(learned_config, X, y_pred, percentile=None):
     if learned_config["region_model_type"] == "single_region":
         membership = np.ones([X_input.shape[0]])
     elif learned_config["region_model_type"] == "multi_region":
-        # load regions model using onnx
         region_model = learned_config["region_model"].encode("ascii")
         region_model = base64.b64decode(region_model)
         sess = rt.InferenceSession(region_model, providers=["CPUExecutionProvider"])
         input_name = sess.get_inputs()[0].name
         label_name = sess.get_outputs()[0].name
+        # prediction = learned_config["region_model"].predict(X_input).flatten()
         prediction = sess.run([label_name], {input_name: X_input.astype(np.float32)})[0]
 
-        # compute membership
         if prediction.shape[0] > 1:
             membership = np.argmin(
                 np.abs(
@@ -85,4 +84,4 @@ def cp_inference(learned_config, X, y_pred, percentile=None):
         if q < 0:
             LOGGER.warning("Warning quantile < 0 for sample " + str(i) + str(q))
         interval.append([y_pred[i, 0] - np.abs(q), y_pred[i, 0] + np.abs(q)])
-    return interval
+    return np.array(interval)
