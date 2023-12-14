@@ -6,7 +6,6 @@ import pandas as pd
 from joblib import dump
 import onnxruntime as rt
 from skl2onnx import to_onnx
-import matplotlib.pyplot as plt
 from sklearn.linear_model import LinearRegression
 from model_trust.datasets.synthetic_data import load_linear_2_region_data
 from model_trust.regression.region_uncertainty_estimation import (
