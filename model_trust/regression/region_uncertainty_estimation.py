@@ -89,7 +89,7 @@ class RegionUncertaintyEstimator(PosthocBaseUncertaintyEstimator):
         self.regions_model_type = regions_model
         self.opset_version = opset_version
 
-    def fit(self, X, y, y_pred):
+    def fit(self, X, y):
         """
         Fit a model with the training data and provide prediction for the test set.
         ----------
@@ -97,7 +97,6 @@ class RegionUncertaintyEstimator(PosthocBaseUncertaintyEstimator):
             model: ML model class with fit and predict methods
             X: np.array containing input features, size (nsamples, feature dims)
             y: np.array containing target variable, size (nsamples,)
-            y_pred: np.array containing predictions from base model, size (nsamples,)
 
         """
 
@@ -106,6 +105,9 @@ class RegionUncertaintyEstimator(PosthocBaseUncertaintyEstimator):
         self.regions_id = {}
         y = y.flatten()  # FORCE 1D DIMENSION O.W. WEIRD CAST HAPPENS
 
+        # compute base model predictions
+        base_model_sess = rt.InferenceSession(self.base_model)
+        y_pred = base_model_sess.run(None, {"X": X.astype(np.float32)})[0].flatten()
         conformity_scores = np.abs(y - y_pred)  # prefit case
 
         ## Input for conformal prediction

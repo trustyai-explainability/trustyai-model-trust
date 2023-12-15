@@ -14,13 +14,24 @@ install_requires = [
     "torch>=2.0.1",
     "protobuf==3.20.2",
     "optuna==3.4.0",
-    "mlprodict",
-    "jyquickhelper",
     "skl2onnx",
     "onnxruntime",
 ]
 
-extra_requires = {"plot": ["matplotlib"]}
+extra_requires = {
+    "plot": ["matplotlib"],
+    "deploy": [
+        "boto3",
+        "kserve",
+    ],
+    "infer": ["openshift-client", "requests"],
+    "test": ["pytest"],
+}
+all_extra_reqs = []
+for key in extra_requires:
+    all_extra_reqs += extra_requires[key]
+
+extra_requires["all"] = all_extra_reqs
 
 # pip install --no-binary lightgbm --config-settings=cmake.define.USE_OPENMP=OFF 'lightgbm>=4.0.0'
 
@@ -31,17 +42,13 @@ setuptools.setup(
     description="IBM Model Trust",
     authos="IBM Research",
     url="https://github.com/trustyai-explainability/trustyai-model-trust",
-    author_email="Natalia.Martinez.Gil@ibm.com, j.srideepika@ibm.com, giridhar.ganapavarapu@ibm.com",
+    author_email="natalia.martinez.gil@ibm.com, j.srideepika@ibm.com, giridhar.ganapavarapu@ibm.com",
     packages=setuptools.find_packages(),
     license="Apache License 2.0",
     long_description=open("README.md", "r", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     install_requires=install_requires,
-    extras_require={
-        "test": [
-            "pytest",
-        ]
-    },
+    extras_require=extra_requires,
     package_data={},
     include_package_data=True,
     zip_safe=False,
